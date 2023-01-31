@@ -143,8 +143,15 @@ impl Residue {
         residue_channels: &BitSet256,
         channels: &mut [DspChannel],
     ) -> Result<()> {
+        let result = if self.setup.residue_type == 2 {
+            self.read_residue_inner_2(bs, bs_exp, codebooks, residue_channels, channels)
+        }
+        else {
+            self.read_residue_inner_01(bs, bs_exp, codebooks, residue_channels, channels)
+        };
+
         // Read the residue, and ignore end-of-bitstream errors which are legal.
-        match self.read_residue_inner(bs, bs_exp, codebooks, residue_channels, channels) {
+        match result {
             Ok(_) => (),
             // An end-of-bitstream error is classified under ErrorKind::Other. This condition
             // should not be treated as an error.
@@ -157,6 +164,9 @@ impl Residue {
             // large vector. This vector is in the scratch-pad buffer and can now be de-interleaved
             // into the channel buffers.
             let stride = residue_channels.count();
+
+            // TODO: Factor out into helper function that processes 2 channels at a time followed by
+            // one remainder.
 
             match stride {
                 2 => {
@@ -197,7 +207,7 @@ impl Residue {
         Ok(())
     }
 
-    fn read_residue_inner(
+    fn read_residue_inner_2(
         &mut self,
         bs: &mut BitReaderRtl<'_>,
         bs_exp: u8,
@@ -209,10 +219,7 @@ impl Residue {
 
         // The actual length of the entire residue vector for a channel (formats 0 and 1), or all
         // interleaved channels (format 2).
-        let full_residue_len = match self.setup.residue_type {
-            2 => ((1 << bs_exp) >> 1) * residue_channels.count(),
-            _ => (1 << bs_exp) >> 1,
-        };
+        let full_residue_len = ((1 << bs_exp) >> 1) * residue_channels.count();
 
         // The range of the residue vector being decoded.
         let limit_residue_begin = min(self.setup.residue_begin as usize, full_residue_len);
@@ -227,31 +234,17 @@ impl Residue {
         // Number of partitions to read.
         let parts_to_read = residue_len / self.setup.residue_partition_size as usize;
 
-        let is_fmt2 = self.setup.residue_type == 2;
+        // Reserve partition classification space in the scratch-pad.
+        self.setup_part_classes(parts_to_read);
 
-        // Setup the scratch-pad.
-        if is_fmt2 {
-            // Reserve partition classification space in the scratch-pad.
-            self.setup_part_classes(parts_to_read);
-
-            // Reserve interleave buffer storage in the scratch-pad.
-            self.setup_type2_buf(full_residue_len);
-        }
-        else {
-            self.setup_part_classes(parts_to_read * residue_channels.count());
-        }
+        // Reserve interleave buffer storage in the scratch-pad.
+        self.setup_type2_buf(full_residue_len);
 
         let mut has_channel_to_decode = false;
 
         // Zero unused residue channels.
         for ch in residue_channels.iter() {
             let channel = &mut channels[ch];
-
-            // Zero the channel residue if not type 2.
-            if !is_fmt2 {
-                channel.residue[..full_residue_len].fill(0.0);
-            }
-
             has_channel_to_decode |= !channel.do_not_decode;
         }
 
@@ -271,36 +264,120 @@ impl Residue {
                 // encoded in the first pass.
                 if pass == 0 {
                     // If using format 2, there is only a single classification list.
-                    if is_fmt2 {
+                    let code = class_book.read_scalar(bs)?;
+
+                    decode_classes(
+                        code,
+                        parts_per_classword,
+                        self.setup.residue_classifications as u32,
+                        &mut self.part_classes[part_first..],
+                    );
+                }
+
+                // The last partition in this batch of partitions, being careful not to exceed the
+                // total number of partitions.
+                let part_last = min(parts_to_read, part_first + parts_per_classword as usize);
+
+                // Iterate over all partitions belonging to the current classword group.
+                for part in part_first..part_last {
+                    let vq_class = &self.setup.residue_vq_class[self.part_classes[part] as usize];
+
+                    if vq_class.is_used(pass) {
+                        let vq_book = &codebooks[vq_class.books[pass] as usize];
+
+                        let part_start = limit_residue_begin + part_size * part;
+
+                        // Residue type 2 is implemented in term of type 1.
+                        read_residue_partition_format1(
+                            bs,
+                            vq_book,
+                            &mut self.type2_buf[part_start..part_start + part_size],
+                        )?;
+                    }
+                }
+                // End of partition batch iteration.
+            }
+            // End of pass iteration.
+        }
+
+        Ok(())
+    }
+
+    fn read_residue_inner_01(
+        &mut self,
+        bs: &mut BitReaderRtl<'_>,
+        bs_exp: u8,
+        codebooks: &[VorbisCodebook],
+        residue_channels: &BitSet256,
+        channels: &mut [DspChannel],
+    ) -> Result<()> {
+        let class_book = &codebooks[self.setup.residue_classbook as usize];
+
+        // The actual length of the entire residue vector for a channel (formats 0 and 1), or all
+        // interleaved channels (format 2).
+        let full_residue_len = (1 << bs_exp) >> 1;
+
+        // The range of the residue vector being decoded.
+        let limit_residue_begin = min(self.setup.residue_begin as usize, full_residue_len);
+        let limit_residue_end = min(self.setup.residue_end as usize, full_residue_len);
+
+        // Length of the decoded part of the residue vector.
+        let residue_len = limit_residue_end - limit_residue_begin;
+
+        // Number of partitions per classword.
+        let parts_per_classword = class_book.dimensions();
+
+        // Number of partitions to read.
+        let parts_to_read = residue_len / self.setup.residue_partition_size as usize;
+
+        // Setup the scratch-pad.
+        self.setup_part_classes(parts_to_read * residue_channels.count());
+
+        let mut has_channel_to_decode = false;
+
+        // Zero unused residue channels.
+        for ch in residue_channels.iter() {
+            let channel = &mut channels[ch];
+
+            // Zero the channel residue if not type 2.
+            channel.residue[..full_residue_len].fill(0.0);
+
+            has_channel_to_decode |= !channel.do_not_decode;
+        }
+
+        // If all channels are marked do-not-decode then immediately exit.
+        if !has_channel_to_decode {
+            return Ok(());
+        }
+
+        let part_size = self.setup.residue_partition_size as usize;
+
+        // Residues may be encoded in up-to 8 passes. Fewer passes may be encoded by prematurely
+        // "ending" the packet. This means that an end-of-bitstream error is actually NOT an error.
+        for pass in 0..self.setup.residue_max_pass + 1 {
+            // Iterate over the partitions in batches grouped by classword.
+            for part_first in (0..parts_to_read).step_by(parts_per_classword as usize) {
+                // The class assignments for each partition in the classword group are only
+                // encoded in the first pass.
+                if pass == 0 {
+                    // For formats 0 and 1, each channel has its own classification list.
+                    for (i, ch) in residue_channels.iter().enumerate() {
+                        let channel = &channels[ch];
+
+                        // If the channel is marked do-not-decode then advance to the next
+                        // channel.
+                        if channel.do_not_decode {
+                            continue;
+                        }
+
                         let code = class_book.read_scalar(bs)?;
 
                         decode_classes(
                             code,
                             parts_per_classword,
                             self.setup.residue_classifications as u32,
-                            &mut self.part_classes[part_first..],
+                            &mut self.part_classes[part_first + i * parts_to_read..],
                         );
-                    }
-                    else {
-                        // For formats 0 and 1, each channel has its own classification list.
-                        for (i, ch) in residue_channels.iter().enumerate() {
-                            let channel = &channels[ch];
-
-                            // If the channel is marked do-not-decode then advance to the next
-                            // channel.
-                            if channel.do_not_decode {
-                                continue;
-                            }
-
-                            let code = class_book.read_scalar(bs)?;
-
-                            decode_classes(
-                                code,
-                                parts_per_classword,
-                                self.setup.residue_classifications as u32,
-                                &mut self.part_classes[part_first + i * parts_to_read..],
-                            );
-                        }
                     }
                 }
 
@@ -314,19 +391,14 @@ impl Residue {
                     for (i, ch) in residue_channels.iter().enumerate() {
                         let channel = &mut channels[ch];
 
-                        let vq_class = if !is_fmt2 {
-                            // If the channel is marked do-no-decode, then advance to the next
-                            // channels.
-                            if channel.do_not_decode {
-                                continue;
-                            }
-
-                            let class_idx = self.part_classes[part + parts_to_read * i] as usize;
-                            &self.setup.residue_vq_class[class_idx]
+                        // If the channel is marked do-no-decode, then advance to the next
+                        // channels.
+                        if channel.do_not_decode {
+                            continue;
                         }
-                        else {
-                            &self.setup.residue_vq_class[self.part_classes[part] as usize]
-                        };
+
+                        let class_idx = self.part_classes[part + parts_to_read * i] as usize;
+                        let vq_class = &self.setup.residue_vq_class[class_idx];
 
                         if vq_class.is_used(pass) {
                             let vq_book = &codebooks[vq_class.books[pass] as usize];
@@ -344,20 +416,8 @@ impl Residue {
                                     vq_book,
                                     &mut channel.residue[part_start..part_start + part_size],
                                 ),
-                                2 => {
-                                    // Residue type 2 is implemented in term of type 1.
-                                    read_residue_partition_format1(
-                                        bs,
-                                        vq_book,
-                                        &mut self.type2_buf[part_start..part_start + part_size],
-                                    )
-                                }
                                 _ => unreachable!(),
                             }?;
-                        }
-
-                        if is_fmt2 {
-                            break;
                         }
                     }
                 }
